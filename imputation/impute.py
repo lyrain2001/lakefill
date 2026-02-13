@@ -7,16 +7,12 @@ import numpy as np
 from collections import defaultdict
 from pathlib import Path
 import openai
+from openai import AzureOpenAI
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import re
 import ast
-
-
-
-
-
 
 class Imputer:
     def __init__(self, args):
@@ -77,8 +73,15 @@ Retrieved Tables:
         self.load_data()
 
     def setup_openai(self):
-        """Setup OpenAI API configuration (openai>=1.0.0)"""
-        self.client = openai.OpenAI(api_key=self.args.api_key, base_url=self.args.api_url)
+        """Setup client: Azure OpenAI (if azure_endpoint set) or OpenAI (base_url + api_key)."""
+        if getattr(self.args, 'azure_endpoint', None):
+            self.client = AzureOpenAI(
+                api_key=self.args.api_key,
+                api_version=self.args.api_version,
+                azure_endpoint=self.args.azure_endpoint,
+            )
+        else:
+            self.client = openai.OpenAI(api_key=self.args.api_key, base_url=self.args.api_url)
         self.model_name = self.args.model
 
     def _normalize_logprobs(self, choice_logprobs):
@@ -166,13 +169,24 @@ Retrieved Tables:
             self.test_qids = json.load(f)['test']
         print(f"Test set size: {len(self.test_qids)}")
 
-        # Load queries
+        # Load queries (handle lines without tab = continuation from newline in value)
         self.queries = {}
+        pending_qid, pending_query = None, None
         with open(f'{self.args.data_path}/queries.tsv', 'r') as f:
             for line in f:
                 line = line.strip()
+                if not line:
+                    continue
+                if '\t' not in line:
+                    if pending_qid is not None:
+                        pending_query = (pending_query or '') + ' ' + line
+                    continue
                 qid, query = int(line[:line.index('\t')]), line[line.index('\t')+1:]
-                self.queries[qid] = self.convert_to_table(query)
+                if pending_qid is not None:
+                    self.queries[pending_qid] = self.convert_to_table(pending_query or '')
+                pending_qid, pending_query = qid, query
+            if pending_qid is not None:
+                self.queries[pending_qid] = self.convert_to_table(pending_query or '')
                 
         # Load ground truth answers and case names
         self.ground_truth = {}
@@ -182,13 +196,24 @@ Retrieved Tables:
                 self.ground_truth[line['query_id']] = line['answers']
                 self.case_names[line['query_id']] = line.get('case_name', f"query_{line['query_id']}")
                 
-        # Load collection
+        # Load collection (handle lines without tab = continuation from newline in value)
         self.collection = {}
+        pending_id, pending_content = None, None
         with open(f'{self.args.data_path}/collection.tsv', 'r') as f:
             for line in f:
                 line = line.strip()
-                qid, query = line[:line.find('\t')], line[line.find('\t')+1:]
-                self.collection[int(qid)] = query
+                if not line:
+                    continue
+                if '\t' not in line:
+                    if pending_id is not None:
+                        pending_content = (pending_content or '') + ' ' + line
+                    continue
+                t_id, tuple_text = line[:line.index('\t')], line[line.index('\t')+1:]
+                if pending_id is not None:
+                    self.collection[int(pending_id)] = pending_content or ''
+                pending_id, pending_content = t_id, tuple_text
+            if pending_id is not None:
+                self.collection[int(pending_id)] = pending_content or ''
                 
         # Load retrieval results
         self.topK_results = self.load_retrieval_results()
@@ -322,10 +347,48 @@ Retrieved Tables:
         # First use strict mode
         strict_predictions, strict_confidences, strict_input, strict_output, strict_logprobs = self.impute_value(qid, 'strict')
 
+        # If strict mode returns no predictions, last chance: run relaxed; if still fails, record empty answer
         if not strict_predictions:
+            relaxed_predictions, relaxed_confidences, relaxed_input, relaxed_output, relaxed_logprobs = self.impute_value(qid, 'relaxed')
+            runtime = time.perf_counter() - t0
+            ground_truth = self.ground_truth.get(qid, {})
+            final_preds = relaxed_predictions or {}
+            final_confs = (relaxed_confidences or {}).get('llm', {})
+            final_correctness = self.verify_predictions(qid, final_preds) if final_preds else {}
+            modes_used = {c: 'relaxed' for c in final_preds}
+            result = {
+                'query_id': qid,
+                'strict_mode': {
+                    'input': strict_input or '',
+                    'output': strict_output or '',
+                    'predictions': {},
+                    'confidences': {'llm': {}, 'nln': {}, 'max_entropy': {}},
+                    'logprobs': strict_logprobs,
+                    'correctness': {}
+                },
+                'relaxed_mode': {
+                    'input': relaxed_input,
+                    'output': relaxed_output,
+                    'predictions': relaxed_predictions or {},
+                    'confidences': relaxed_confidences or {'llm': {}, 'nln': {}, 'max_entropy': {}},
+                    'logprobs': relaxed_logprobs,
+                    'correctness': self.verify_predictions(qid, relaxed_predictions) if relaxed_predictions else {}
+                },
+                'final_predictions': final_preds,
+                'final_confidences': final_confs,
+                'ground_truth': ground_truth,
+                'modes_used': modes_used,
+                'final_correctness': final_correctness,
+                'runtime': runtime
+            }
+            with self.lock:
+                with jsonlines.open(self.args.output_path, 'a') as fout:
+                    fout.write(result)
+                if getattr(self.args, 'stats_csv_path', None):
+                    self._append_stats_row(qid, final_preds, final_confs, ground_truth, final_correctness, runtime)
             return
-            
-        # Initialize final results
+
+        # Initialize final results (strict had at least some predictions)
         final_predictions = {}
         final_confidences = {}
         modes_used = {}
@@ -337,7 +400,7 @@ Retrieved Tables:
         relaxed_output = None
         relaxed_logprobs = None
         
-        # Process each missing column
+        # Process each missing column: use strict when confidence >= threshold, else try relaxed
         for col in strict_predictions:
             if col not in strict_confidences['llm']:
                 continue
@@ -946,10 +1009,12 @@ Answer only 'Yes' or 'No'."""
 
 def main():
     parser = argparse.ArgumentParser()
-    # API related parameters
-    parser.add_argument('--api_url', type=str, required=True)
-    parser.add_argument('--api_key', type=str, required=True)
-    parser.add_argument('--model', type=str, default="gpt-4")
+    # API: either OpenAI (api_url + api_key) or Azure (azure_endpoint + api_key + api_version)
+    parser.add_argument('--api_url', type=str, default=None, help='OpenAI-compatible base URL (omit when using Azure)')
+    parser.add_argument('--api_key', type=str, default=None, help='API key (OpenAI or Azure)')
+    parser.add_argument('--azure_endpoint', type=str, default=None, help='Azure OpenAI endpoint (e.g. https://xxx.openai.azure.com/)')
+    parser.add_argument('--api_version', type=str, default=None, help='Azure API version (e.g. 2024-08-01-preview)')
+    parser.add_argument('--model', type=str, default="gpt-4o", help='Model or Azure deployment name')
     
     # Data path parameters
     parser.add_argument('--data_path', type=str, required=True)
@@ -973,6 +1038,14 @@ def main():
                         help='If set, append stats row (case,acc,fail,output,ground_truth,conf,runtime) after each case; conf = LLM confidence from LakeFill')
     
     args = parser.parse_args()
+    
+    use_azure = bool(getattr(args, 'azure_endpoint', None))
+    if use_azure:
+        if not args.api_key or not getattr(args, 'api_version', None):
+            raise ValueError('When using Azure, --api_key and --api_version are required')
+    else:
+        if not args.api_key or not args.api_url:
+            raise ValueError('When not using Azure, --api_key and --api_url are required')
     
     # Ensure output directory exists
     Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)

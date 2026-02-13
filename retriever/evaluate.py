@@ -119,32 +119,37 @@ def evaluation(args, docs, qrels, fold_name='dev'):
     output_file = f'./retrieval_results/Siamese_{args.dataset_name}_top100_res_with_score.tsv'
     f_writer = open(output_file, 'w')
 
-    # Process queries and retrieve documents
+    # Process queries and retrieve documents (handle lines without tab = continuation from newline in value)
     print("Processing queries...")
+    pending_qid, pending_query = None, None
+
+    def process_query(qid, query):
+        if args.mask:
+            query = query.replace('N/A', '<MASK>')
+        top_documents = retriever.retrieve(query, top_k=100, document_store=document_store)
+        document_ids = [doc.id for doc in top_documents]
+        for rank, d_id in enumerate(document_ids):
+            score = top_documents[rank].score if hasattr(top_documents[rank], 'score') and top_documents[rank].score is not None else 0.0
+            rank_record = '\t'.join([str(qid), str(d_id), str(score)])
+            f_writer.write(rank_record + '\n')
+        rank_result[qid] = [int(doc_id) for doc_id in document_ids]
+
     with open(os.path.join(args.data_path, 'queries.tsv'), 'r') as f:
         for line in f:
             line = line.strip()
+            if not line:
+                continue
+            if '\t' not in line:
+                if pending_qid is not None:
+                    pending_query = (pending_query or '') + ' ' + line
+                continue
             qid, query = int(line[:line.index('\t')]), line[line.index('\t')+1:]
-            
-            # Apply mask if specified
-            if args.mask:
-                query = query.replace('N/A', '<MASK>')
+            if pending_qid is not None:
+                process_query(pending_qid, pending_query or '')
+            pending_qid, pending_query = qid, query
+        if pending_qid is not None:
+            process_query(pending_qid, pending_query or '')
 
-            # Retrieve top documents
-            top_documents = retriever.retrieve(query, top_k=100, document_store=document_store)
-            document_ids, document_text, document_scores = [], [], []
-            
-            for document in top_documents:
-                document_ids.append(document.id)
-                document_text.append(document.content)
-                document_scores.append(document.score)
-                
-            # Write results to file
-            for rank, d_id in enumerate(document_ids):
-                rank_record = '\t'.join([str(qid), str(d_id), str(document_scores[rank])])
-                f_writer.write(rank_record + '\n')
-
-            rank_result[qid] = [int(doc_id) for doc_id in document_ids]
     # Close the output file
     f_writer.close()
     

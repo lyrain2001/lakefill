@@ -59,6 +59,14 @@ def convert_file_to_tuple(file_path: str,
     with open(file_path, 'r') as f:
         for line in f:
             line = line.strip()
+            if not line:
+                continue
+            if '\t' not in line:
+                # Line has no tab (e.g. continuation from newline in value); merge into previous doc if any
+                if documents:
+                    prev = documents[-1]
+                    documents[-1] = Document(id=prev.id, content=prev.content + " " + line, content_type='text')
+                continue
             t_id, tuple_text = line[:line.index('\t')], line[line.index('\t')+1:]
             documents.append(Document(id=t_id, content=tuple_text, content_type='text'))
     return documents

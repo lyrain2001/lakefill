@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import jsonlines
 import time
@@ -76,11 +77,24 @@ Retrieved Tables:
         self.load_data()
 
     def setup_openai(self):
-        """Setup OpenAI API configuration"""
-        openai.api_key = self.args.api_key
-        openai.api_base = self.args.api_url
+        """Setup OpenAI API configuration (openai>=1.0.0)"""
+        self.client = openai.OpenAI(api_key=self.args.api_key, base_url=self.args.api_url)
         self.model_name = self.args.model
-    
+
+    def _normalize_logprobs(self, choice_logprobs):
+        """Convert openai>=1.0 logprobs to dict format expected by extract_prediction."""
+        if not choice_logprobs or not choice_logprobs.content:
+            return None
+        content = []
+        for item in choice_logprobs.content:
+            lp = getattr(item, "logprob", None)
+            if lp is None:
+                lp = 0.0
+            entry = {"token": getattr(item, "token", "") or "", "logprob": lp}
+            top = getattr(item, "top_logprobs", None) or []
+            entry["top_logprobs"] = [{"token": getattr(t, "token", "") or "", "logprob": getattr(t, "logprob", None) or 0.0} for t in top]
+            content.append(entry)
+        return {"content": content}
 
     def convert_to_table(self, serialized_tuple):
         """Convert serialized tuple to table format"""
@@ -160,11 +174,13 @@ Retrieved Tables:
                 qid, query = int(line[:line.index('\t')]), line[line.index('\t')+1:]
                 self.queries[qid] = self.convert_to_table(query)
                 
-        # Load ground truth answers
+        # Load ground truth answers and case names
         self.ground_truth = {}
+        self.case_names = {}
         with jsonlines.open(f'{self.args.data_path}/answers.jsonl', 'r') as f:
             for line in f:
                 self.ground_truth[line['query_id']] = line['answers']
+                self.case_names[line['query_id']] = line.get('case_name', f"query_{line['query_id']}")
                 
         # Load collection
         self.collection = {}
@@ -204,7 +220,28 @@ Retrieved Tables:
                     if 'query_id' in line:
                         processed_qids.add(line['query_id'])
         return processed_qids
-    
+
+    def _append_stats_row(self, qid, final_predictions, final_confidences, ground_truth, final_correctness, runtime):
+        """Append one row to stats CSV: case, acc, fail, output, ground_truth, conf, runtime. conf = LLM confidence from LakeFill."""
+        stats_path = Path(self.args.stats_csv_path)
+        write_header = not stats_path.exists() or stats_path.stat().st_size == 0
+        case_name = self.case_names.get(qid, f'query_{qid}')
+        if not ground_truth:
+            acc, fail, output, gt_str, conf = 0, 1.0, '', '', 0.0
+        else:
+            cols = list(ground_truth.keys())
+            correct_list = [final_correctness.get(c, 0) for c in cols]
+            acc = 1 if all(correct_list) and correct_list else 0
+            fail = 0.0 if acc == 1 else 1.0
+            output = final_predictions.get(cols[0], '[UNKNOWN]') if cols else '[UNKNOWN]'
+            gt_str = ground_truth.get(cols[0], '') if cols else ''
+            confs = [final_confidences.get(c, 0.0) for c in cols if c in final_confidences]
+            conf = float(np.mean(confs)) if confs else 0.0
+        with open(stats_path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(['case', 'acc', 'fail', 'output', 'ground_truth', 'conf', 'runtime'])
+            writer.writerow([case_name, acc, fail, output, gt_str, conf, round(runtime, 6)])
     
     def extract_attributes(self, serialized_tuple):
         """Extract attributes and values from table-format tuple"""
@@ -280,15 +317,10 @@ Retrieved Tables:
         return predictions, confidences, input_data, output, logprobs
     
     def process_query(self, qid):
-
         """Process single query, including both strict and relaxed modes"""
+        t0 = time.perf_counter()
         # First use strict mode
         strict_predictions, strict_confidences, strict_input, strict_output, strict_logprobs = self.impute_value(qid, 'strict')
-        
-        print("="*50)
-        print( strict_predictions, strict_confidences)
-        print("="*30)
-        print(strict_input, strict_output )
 
         if not strict_predictions:
             return
@@ -332,6 +364,9 @@ Retrieved Tables:
                     final_confidences[col] = confidence
                     modes_used[col] = 'strict_fallback'
         
+        runtime = time.perf_counter() - t0
+        final_correctness = self.verify_predictions(qid, final_predictions)
+        ground_truth = self.ground_truth.get(qid, {})
         
         # Record results
         result = {
@@ -354,35 +389,36 @@ Retrieved Tables:
             },
             'final_predictions': final_predictions,
             'final_confidences': final_confidences,
-            'ground_truth': self.ground_truth.get(qid, {}),
+            'ground_truth': ground_truth,
             'modes_used': modes_used,
-            'final_correctness': self.verify_predictions(qid, final_predictions)
+            'final_correctness': final_correctness,
+            'runtime': runtime
         }
         
-        # Safely write to file
+        # Safely write to file and optionally append stats row (real-time)
         with self.lock:
             with jsonlines.open(self.args.output_path, 'a') as fout:
                 fout.write(result)
-    
-    
+            if getattr(self.args, 'stats_csv_path', None):
+                self._append_stats_row(qid, final_predictions, final_confidences, ground_truth, final_correctness, runtime)
     
     def chat(self, input_data: str, temperature: float = 0.3, model_name: str = None) -> tuple:
-        """Get response and logprobs using OpenAI API"""
-
+        """Get response and logprobs using OpenAI API (openai>=1.0.0)."""
         messages = [{"role": "user", "content": input_data}]
-        
+        model = model_name or self.model_name
         while True:
             try:
-                response = openai.ChatCompletion.create(
-                    model=self.model_name if model_name is None else model_name,
+                response = self.client.chat.completions.create(
+                    model=model,
                     messages=messages,
                     temperature=temperature,
                     logprobs=True,
-                    top_logprobs=5
+                    top_logprobs=5,
                 )
-               
-                return (response['choices'][0]['message']['content'], response['choices'][0]['logprobs'])
-            
+                choice = response.choices[0]
+                content = (choice.message.content or "").strip()
+                logprobs = self._normalize_logprobs(choice.logprobs) if choice.logprobs else None
+                return (content, logprobs)
             except Exception as e:
                 print(f"Error: API request failed: {str(e)}, retrying in 1 second")
                 time.sleep(1)
@@ -417,12 +453,15 @@ Retrieved Tables:
         for col in missing_columns:
             if col in result:
                 if isinstance(result[col], dict):
-                    # Get imputed_value, ensure string type handling
+                    # Get imputed_value, ensure string type handling (LLM may return dict/nested)
                     imputed_value = result[col].get('imputed_value', '')
                     if isinstance(imputed_value, (int, float)):
                         predictions[col] = str(imputed_value).strip()
-                    else:
+                    elif isinstance(imputed_value, str):
                         predictions[col] = imputed_value.lower().strip()
+                    else:
+                        # dict, list, None, etc. – convert to string
+                        predictions[col] = str(imputed_value).strip().lower() if imputed_value is not None else ''
                     
                     # Handle empty confidence values or invalid confidence values
                     confidence_value = result[col].get('confidence', 0)
@@ -784,7 +823,8 @@ Answer only 'Yes' or 'No'."""
 
     def run(self):
         """Run imputation program"""
-        # Get processed queries
+        from tqdm import tqdm
+        # Get processed queries (skip existing on restart)
         processed_qids = self.get_processed_queries()
         print(f"Number of processed queries: {len(processed_qids)}")
         
@@ -792,8 +832,12 @@ Answer only 'Yes' or 'No'."""
         remaining_qids = [qid for qid in self.test_qids if qid not in processed_qids]
         print(f"Number of remaining queries to process: {len(remaining_qids)}")
         
-        for qid in remaining_qids:
-            self.process_query(qid)
+        if self.args.num_threads > 1:
+            with ThreadPoolExecutor(max_workers=self.args.num_threads) as executor:
+                list(tqdm(executor.map(self.process_query, remaining_qids), total=len(remaining_qids), desc="Imputing values"))
+        else:
+            for qid in tqdm(remaining_qids, desc="Imputing values"):
+                self.process_query(qid)
             
         # Save verification cache
         self.save_verification_cache()
@@ -925,11 +969,15 @@ def main():
     # Add an argument for evaluation only mode
     parser.add_argument('--evaluation_only', action='store_true',
                         help='Run in evaluation only mode without processing new data')
+    parser.add_argument('--stats_csv_path', type=str, default=None,
+                        help='If set, append stats row (case,acc,fail,output,ground_truth,conf,runtime) after each case; conf = LLM confidence from LakeFill')
     
     args = parser.parse_args()
     
     # Ensure output directory exists
     Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
+    if getattr(args, 'stats_csv_path', None):
+        Path(args.stats_csv_path).parent.mkdir(parents=True, exist_ok=True)
     
     # Run the imputer
     imputer = Imputer(args)

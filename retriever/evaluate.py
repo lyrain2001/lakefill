@@ -84,6 +84,9 @@ def evaluation(args, docs, qrels, fold_name='dev'):
     # Create index name and path
     index_name = f"{args.model_name}_{args.dataset_name}"
     index_path = os.path.join(args.temp_index_path, index_name) + '.faiss'
+    # SQL DB must live next to FAISS index so cleaning temp_index_path removes both
+    sql_db_path = os.path.join(args.temp_index_path, index_name) + '_faiss_document_store.db'
+    sql_url = "sqlite:///" + sql_db_path
     print(f"Index path: {index_path}")
     print(f"Index name: {index_name}")
     
@@ -93,12 +96,17 @@ def evaluation(args, docs, qrels, fold_name='dev'):
     # Create or load FAISS document store
     if not os.path.exists(index_path):
         print("Creating new FAISS index...")
-        document_store = FAISSDocumentStore(faiss_index_factory_str="Flat", index=index_name)
+        document_store = FAISSDocumentStore(
+            faiss_index_factory_str="Flat",
+            index=index_name,
+            sql_url=sql_url,
+        )
         document_store.write_documents(docs)
         document_store.update_embeddings(retriever)
         document_store.save(index_path=index_path)
     else:
         print("Loading existing FAISS index...")
+        # Config saved alongside .faiss contains sql_url pointing to same dir
         document_store = FAISSDocumentStore(faiss_index_path=index_path)
 
     # Initialize result storage

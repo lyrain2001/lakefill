@@ -4,14 +4,56 @@ import json
 import jsonlines
 import time
 import numpy as np
+import pandas as pd
 from collections import defaultdict
 from pathlib import Path
 import openai
 from openai import AzureOpenAI
 import math
-import threading
-from concurrent.futures import ThreadPoolExecutor
 import re
+import threading
+
+# Pricing $/1M tokens (aligned with llm-autofill gpt_price.py) for usage/cost logging
+PRICING = {
+    "gpt-4o-mini": {"input_per_1m": 0.15, "output_per_1m": 0.60},
+    "gpt-4o": {"input_per_1m": 2.50, "output_per_1m": 10.00},
+    "gpt-4": {"input_per_1m": 2.50, "output_per_1m": 10.00},
+}
+
+def _extract_usage(response) -> tuple:
+    """Return (prompt_tokens, completion_tokens, total_tokens) from chat completion response."""
+    if not getattr(response, "usage", None) or response.usage is None:
+        return 0, 0, 0
+    u = response.usage
+    prompt = getattr(u, "prompt_tokens", None) or getattr(u, "input_tokens", None) or 0
+    completion = getattr(u, "completion_tokens", None) or getattr(u, "output_tokens", None) or 0
+    total = getattr(u, "total_tokens", None) or (prompt + completion)
+    return int(prompt), int(completion), int(total)
+
+def _compute_cost(model_name: str, prompt_tokens: int, completion_tokens: int) -> tuple:
+    """Return (input_cost, output_cost, total_cost)."""
+    for key, rates in PRICING.items():
+        if key in model_name or model_name in key:
+            in_per_1m = rates["input_per_1m"]
+            out_per_1m = rates["output_per_1m"]
+            input_cost = (prompt_tokens / 1e6) * in_per_1m
+            output_cost = (completion_tokens / 1e6) * out_per_1m
+            return input_cost, output_cost, input_cost + output_cost
+    return 0.0, 0.0, 0.0
+
+def _azure_entra_client(azure_endpoint: str, api_version: str):
+    """Build Azure OpenAI client using Entra ID (DefaultAzureCredential). Matches llm-autofill/autofill/models/gpt.py get_gpt_ft_client."""
+    from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+    token_provider = get_bearer_token_provider(
+        DefaultAzureCredential(),
+        "https://cognitiveservices.azure.com/.default",
+    )
+    return AzureOpenAI(
+        api_version=api_version,
+        azure_ad_token_provider=token_provider,
+        azure_endpoint=azure_endpoint.rstrip("/"),
+    )
+from concurrent.futures import ThreadPoolExecutor
 import ast
 
 class Imputer:
@@ -73,13 +115,22 @@ Retrieved Tables:
         self.load_data()
 
     def setup_openai(self):
-        """Setup client: Azure OpenAI (if azure_endpoint set) or OpenAI (base_url + api_key)."""
-        if getattr(self.args, 'azure_endpoint', None):
-            self.client = AzureOpenAI(
-                api_key=self.args.api_key,
-                api_version=self.args.api_version,
-                azure_endpoint=self.args.azure_endpoint,
+        """Setup client: Azure (key or Entra ID) or OpenAI (base_url + api_key)."""
+        if getattr(self.args, "azure_endpoint", None):
+            use_entra = getattr(self.args, "azure_use_entra_id", False) or not getattr(
+                self.args, "api_key", None
             )
+            if use_entra:
+                self.client = _azure_entra_client(
+                    self.args.azure_endpoint,
+                    getattr(self.args, "api_version", "2024-12-01-preview"),
+                )
+            else:
+                self.client = AzureOpenAI(
+                    api_key=self.args.api_key,
+                    api_version=self.args.api_version,
+                    azure_endpoint=self.args.azure_endpoint,
+                )
         else:
             self.client = openai.OpenAI(api_key=self.args.api_key, base_url=self.args.api_url)
         self.model_name = self.args.model
@@ -268,6 +319,28 @@ Retrieved Tables:
                 writer.writerow(['case', 'acc', 'fail', 'output', 'ground_truth', 'conf', 'runtime'])
             writer.writerow([case_name, acc, fail, output, gt_str, conf, round(runtime, 6)])
     
+    def _append_usage_row(self, qid, mode: str, usage: dict) -> None:
+        """Append one usage/cost row (strict or relaxed) in benchmark-style format."""
+        fp = getattr(self.args, 'usage_csv_path', None)
+        if not fp:
+            return
+        case_name = self.case_names.get(qid, f"query_{qid}")
+        row = {
+            "case": case_name,
+            "mode": mode,
+            "model": self.model_name,
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+            "input_cost": usage.get("input_cost", 0.0),
+            "output_cost": usage.get("output_cost", 0.0),
+            "total_cost": usage.get("total_cost", 0.0),
+            "retries": usage.get("retries", 0),
+            "latency_ms": usage.get("latency_ms", 0),
+        }
+        with self.lock:
+            pd.DataFrame([row]).to_csv(fp, mode="a", header=not Path(fp).exists(), index=False)
+    
     def extract_attributes(self, serialized_tuple):
         """Extract attributes and values from table-format tuple"""
         attributes = {}
@@ -328,28 +401,32 @@ Retrieved Tables:
         missing_columns = self.get_missing_columns(attributes)
        
         if not missing_columns:
-            return None, None, None, None, None
+            return None, None, None, None, None, None
             
         # Construct input
         input_data = self.construct_input(qid, missing_columns, mode)
         
-        # Get output
-        output, logprobs = self.chat(input_data)
+        # Get output and usage
+        output, logprobs, usage = self.chat(input_data)
         
         # Extract predictions and confidence scores
         predictions, confidences = self.extract_prediction(output, logprobs, missing_columns, mode)
         
-        return predictions, confidences, input_data, output, logprobs
+        return predictions, confidences, input_data, output, logprobs, usage
     
     def process_query(self, qid):
         """Process single query, including both strict and relaxed modes"""
         t0 = time.perf_counter()
         # First use strict mode
-        strict_predictions, strict_confidences, strict_input, strict_output, strict_logprobs = self.impute_value(qid, 'strict')
+        strict_predictions, strict_confidences, strict_input, strict_output, strict_logprobs, strict_usage = self.impute_value(qid, 'strict')
+        if strict_usage:
+            self._append_usage_row(qid, 'strict', strict_usage)
 
         # If strict mode returns no predictions, last chance: run relaxed; if still fails, record empty answer
         if not strict_predictions:
-            relaxed_predictions, relaxed_confidences, relaxed_input, relaxed_output, relaxed_logprobs = self.impute_value(qid, 'relaxed')
+            relaxed_predictions, relaxed_confidences, relaxed_input, relaxed_output, relaxed_logprobs, relaxed_usage = self.impute_value(qid, 'relaxed')
+            if relaxed_usage:
+                self._append_usage_row(qid, 'relaxed', relaxed_usage)
             runtime = time.perf_counter() - t0
             ground_truth = self.ground_truth.get(qid, {})
             final_preds = relaxed_predictions or {}
@@ -399,6 +476,7 @@ Retrieved Tables:
         relaxed_input = None
         relaxed_output = None
         relaxed_logprobs = None
+        relaxed_usage = None
         
         # Process each missing column: use strict when confidence >= threshold, else try relaxed
         for col in strict_predictions:
@@ -415,7 +493,9 @@ Retrieved Tables:
             else:
                 # If relaxed mode hasn't been run yet, run it now
                 if relaxed_predictions is None:
-                    relaxed_predictions, relaxed_confidences, relaxed_input, relaxed_output, relaxed_logprobs = self.impute_value(qid, 'relaxed')
+                    relaxed_predictions, relaxed_confidences, relaxed_input, relaxed_output, relaxed_logprobs, relaxed_usage = self.impute_value(qid, 'relaxed')
+                    if relaxed_usage:
+                        self._append_usage_row(qid, 'relaxed', relaxed_usage)
                 
                 if relaxed_predictions and col in relaxed_predictions:
                     final_predictions[col] = relaxed_predictions[col]
@@ -466,9 +546,11 @@ Retrieved Tables:
                 self._append_stats_row(qid, final_predictions, final_confidences, ground_truth, final_correctness, runtime)
     
     def chat(self, input_data: str, temperature: float = 0.3, model_name: str = None) -> tuple:
-        """Get response and logprobs using OpenAI API (openai>=1.0.0)."""
+        """Get response, logprobs, and usage/cost. Returns (content, logprobs, usage_dict). usage_dict has prompt_tokens, completion_tokens, total_tokens, input_cost, output_cost, total_cost, retries, latency_ms."""
         messages = [{"role": "user", "content": input_data}]
         model = model_name or self.model_name
+        retries = 0
+        t0 = time.perf_counter()
         while True:
             try:
                 response = self.client.chat.completions.create(
@@ -478,11 +560,25 @@ Retrieved Tables:
                     logprobs=True,
                     top_logprobs=5,
                 )
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                prompt_tokens, completion_tokens, total_tokens = _extract_usage(response)
+                input_cost, output_cost, total_cost = _compute_cost(model, prompt_tokens, completion_tokens)
+                usage = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "input_cost": input_cost,
+                    "output_cost": output_cost,
+                    "total_cost": total_cost,
+                    "retries": retries,
+                    "latency_ms": latency_ms,
+                }
                 choice = response.choices[0]
                 content = (choice.message.content or "").strip()
                 logprobs = self._normalize_logprobs(choice.logprobs) if choice.logprobs else None
-                return (content, logprobs)
+                return (content, logprobs, usage)
             except Exception as e:
+                retries += 1
                 print(f"Error: API request failed: {str(e)}, retrying in 1 second")
                 time.sleep(1)
 
@@ -760,22 +856,33 @@ Retrieved Tables:
                 answer_format += f'"{col}": {{"imputed_value": "", "confidence": ""}}, '
             answer_format = answer_format[:-2] + '}'
             
-            # Get retrieval results
+            # Get retrieval results; truncate to stay under model context (e.g. 128k tokens)
+            max_chars = getattr(self.args, 'max_prompt_chars', 480000)
+            doc_ids = self.topK_results.get(qid, [])
             retrieved_tables_text = ''
-            if qid in self.topK_results:
-                for rank, docid in enumerate(self.topK_results[qid]):
+            for n in range(len(doc_ids), 0, -1):
+                retrieved_tables_text = ''
+                for rank, docid in enumerate(doc_ids[:n]):
                     retrieved_tables_text += f'Table {rank+1}: {self.convert_to_table(self.collection[docid])}\n\n'
-
+                prompt = self.strict_template.format(
+                    answer_format=answer_format,
+                    question=question,
+                    retrieved_tables=retrieved_tables_text,
+                    address_instructions=address_instructions
+                )
+                if len(prompt) <= max_chars:
+                    return prompt
+            # fallback: no tables fit
             return self.strict_template.format(
                 answer_format=answer_format,
                 question=question,
-                retrieved_tables=retrieved_tables_text,
+                retrieved_tables='[Truncated: retrieved tables exceeded context limit.]\n',
                 address_instructions=address_instructions
             )
 
     
     def construct_naive_input(self, qid, missing_columns, address_instructions=""):
-        """Construct model input for naive filling mode"""
+        """Construct model input for naive filling mode; truncate tables to stay under context limit."""
         question = self.queries[qid]
         
         # Build answer format
@@ -784,16 +891,25 @@ Retrieved Tables:
             answer_format += f'"{col}": {{"imputed_value": "", "confidence": ""}}, '
         answer_format = answer_format[:-2] + '}'
         
-        # Get retrieved tables
+        max_chars = getattr(self.args, 'max_prompt_chars', 480000)
+        doc_ids = self.topK_results.get(qid, [])[:5]  # relaxed originally used 5
         retrieved_tables_text = ''
-        if qid in self.topK_results:
-            for rank, docid in enumerate(self.topK_results[qid][:5]):
+        for n in range(len(doc_ids), 0, -1):
+            retrieved_tables_text = ''
+            for rank, docid in enumerate(doc_ids[:n]):
                 retrieved_tables_text += f'Table {rank+1}: {self.convert_to_table(self.collection[docid])}\n\n'
-        
+            prompt = self.relaxed_template.format(
+                answer_format=answer_format,
+                question=question,
+                retrieved_tables=retrieved_tables_text,
+                address_instructions=address_instructions
+            )
+            if len(prompt) <= max_chars:
+                return prompt
         return self.relaxed_template.format(
             answer_format=answer_format,
             question=question,
-            retrieved_tables=retrieved_tables_text,
+            retrieved_tables='[Truncated: exceeded context limit.]\n',
             address_instructions=address_instructions
         )
 
@@ -858,7 +974,7 @@ Answer Set: {answer_set}
 Answer only 'Yes' or 'No'."""
 
 
-        response, _ = self.chat(prompt, model_name='gpt-4o-mini')
+        response, _, _ = self.chat(prompt, model_name='gpt-4o-mini')
         result = 1 if 'yes' in response.lower() else 0
         
         # Save to cache
@@ -1009,11 +1125,12 @@ Answer only 'Yes' or 'No'."""
 
 def main():
     parser = argparse.ArgumentParser()
-    # API: either OpenAI (api_url + api_key) or Azure (azure_endpoint + api_key + api_version)
+    # API: either OpenAI (api_url + api_key) or Azure (azure_endpoint + api_key or --azure_use_entra_id + api_version)
     parser.add_argument('--api_url', type=str, default=None, help='OpenAI-compatible base URL (omit when using Azure)')
-    parser.add_argument('--api_key', type=str, default=None, help='API key (OpenAI or Azure)')
+    parser.add_argument('--api_key', type=str, default=None, help='API key (OpenAI or Azure); omit with --azure_use_entra_id for Entra ID')
     parser.add_argument('--azure_endpoint', type=str, default=None, help='Azure OpenAI endpoint (e.g. https://xxx.openai.azure.com/)')
     parser.add_argument('--api_version', type=str, default=None, help='Azure API version (e.g. 2024-08-01-preview)')
+    parser.add_argument('--azure_use_entra_id', action='store_true', help='Use Azure Entra ID (DefaultAzureCredential) instead of api_key')
     parser.add_argument('--model', type=str, default="gpt-4o", help='Model or Azure deployment name')
     
     # Data path parameters
@@ -1036,13 +1153,20 @@ def main():
                         help='Run in evaluation only mode without processing new data')
     parser.add_argument('--stats_csv_path', type=str, default=None,
                         help='If set, append stats row (case,acc,fail,output,ground_truth,conf,runtime) after each case; conf = LLM confidence from LakeFill')
+    parser.add_argument('--usage_csv_path', type=str, default=None,
+                        help='If set, append usage/cost rows per case and mode (strict, relaxed) in benchmark-style format')
+    parser.add_argument('--max_prompt_chars', type=int, default=480000,
+                        help='Max prompt length in characters (~120k tokens at 4 chars/token). Truncate retrieved tables to stay under model context (e.g. 128k).')
     
     args = parser.parse_args()
     
     use_azure = bool(getattr(args, 'azure_endpoint', None))
     if use_azure:
-        if not args.api_key or not getattr(args, 'api_version', None):
-            raise ValueError('When using Azure, --api_key and --api_version are required')
+        use_entra = getattr(args, 'azure_use_entra_id', False)
+        if not use_entra and not args.api_key:
+            raise ValueError('When using Azure without --azure_use_entra_id, --api_key is required')
+        if not getattr(args, 'api_version', None):
+            raise ValueError('When using Azure, --api_version is required')
     else:
         if not args.api_key or not args.api_url:
             raise ValueError('When not using Azure, --api_key and --api_url are required')
@@ -1051,6 +1175,8 @@ def main():
     Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
     if getattr(args, 'stats_csv_path', None):
         Path(args.stats_csv_path).parent.mkdir(parents=True, exist_ok=True)
+    if getattr(args, 'usage_csv_path', None):
+        Path(args.usage_csv_path).parent.mkdir(parents=True, exist_ok=True)
     
     # Run the imputer
     imputer = Imputer(args)
